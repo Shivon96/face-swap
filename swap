@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Realtime Face Swap — Full Functional</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; background:#0b1020; color:#e6eef8; text-align:center; padding:16px; }
+    h1 { margin: 6px 0 14px 0; font-weight:600; }
+    .controls { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-bottom:12px; }
+    button,input { padding:8px 12px; border-radius:6px; border: none; background:#1f6feb; color:white; cursor:pointer; }
+    button.secondary { background:#2d3748; }
+    #stage { display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+    video, canvas { background:#000; border-radius:8px; box-shadow:0 4px 18px rgba(0,0,0,0.6); width:420px; max-width:90vw; height:auto; }
+    #notes { font-size:13px; color:#98a0b3; margin-top:12px; max-width:900px; margin-left:auto; margin-right:auto; text-align:left; }
+  </style>
+</head>
+<body>
+  <h1>Realtime Face Swap — Full Functional</h1>
+
+  <div class="controls">
+    <input id="srcFile" type="file" accept="image/*" />
+    <button id="startCam">Start Camera</button>
+    <button id="startSwap" class="secondary" disabled>Start Swap</button>
+    <button id="stopSwap" class="secondary" disabled>Stop</button>
+    <button id="snapshot">Download Snapshot</button>
+  </div>
+
+  <div id="stage">
+    <div>
+      <div style="font-size:13px;color:#9fb0d6;margin-bottom:6px">Camera</div>
+      <video id="video" autoplay muted playsinline></video>
+    </div>
+    <div>
+      <div style="font-size:13px;color:#9fb0d6;margin-bottom:6px">Output</div>
+      <canvas id="output" width="640" height="480"></canvas>
+    </div>
+  </div>
+
+  <div id="notes">
+    <p><strong>Notes:</strong> This page uses MediaPipe FaceMesh (468 points) for accurate landmarking and OpenCV.js for warping & blending. Serve the file through <code>http(s)</code> (or <code>localhost</code>). Allow camera permission. Performance depends on device — reduce canvas size for faster results.</p>
+  </div>
+
+  <!-- Mediapipe FaceMesh (JS) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <!-- OpenCV.js -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+  <script>
+  (function(){
+    // DOM
+    const video = document.getElementById('video');
+    const output = document.getElementById('output');
+    const outCtx = output.getContext('2d');
+    const srcFile = document.getElementById('srcFile');
+    const startCamBtn = document.getElementById('startCam');
+    const startSwapBtn = document.getElementById('startSwap');
+    const stopSwapBtn = document.getElementById('stopSwap');
+    const snapshotBtn = document.getElementById('snapshot');
+
+    // State
+    let camStream = null;
+    let camReady = false;
+    let openCvReady = false;
+    let swapRunning = false;
+    let srcImg = null;                 // HTMLImageElement for uploaded image
+    let srcLandmarks = null;           // array of {x,y} in source pixel coords (468)
+    let srcTriangles = null;           // Delaunay triangulation indices based on source points
+    let faceMesh = null;
+    let cameraHelper = null;
+    let lastFrameMat = null;
+
+    // Canvas sizes (you can reduce for speed)
+    const OUT_W = 640;
+    const OUT_H = 480;
+    output.width = OUT_W;
+    output.height = OUT_H;
+
+    // Wait for OpenCV ready
+    function waitForOpenCv() {
+      return new Promise((resolve) => {
+        if (window.cv && window.cv['onRuntimeInitialized']) {
+          window.cv['onRuntimeInitialized'] = () => {
+            openCvReady = true;
+            resolve();
+          };
+        } else {
+          // In case already loaded
+          const check = setInterval(() => {
+            if (window.cv) {
+              clearInterval(check);
+              openCvReady = true;
+              resolve();
+            }
+          }, 100);
+        }
+      });
+    }
+
+    // Setup Mediapipe FaceMesh
+    function setupFaceMesh(onResults) {
+      faceMesh = new FaceMesh({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+      });
+      faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: true,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.5
+      });
+      faceMesh.onResults(onResults);
+    }
+
+    // Convert normalized mediapipe landmarks to pixel coords for a given width/height
+    function mpToPixels(landmarks, width, height) {
+      return landmarks.map(l => ({ x: l.x * width, y: l.y * height }));
+    }
+
+    // Delaunay triangulation helper using OpenCV Subdiv2D on target rectangle
+    function calculateDelaunayTriangles(points, width, height) {
+      // points: array [ {x,y}, ... ]
+      const rect = new cv.Rect(0, 0, width, height);
+      const subdiv = new cv.Subdiv2D(rect);
+      for (let p of points) subdiv.insert(new cv.Point(p.x, p.y));
+      const triangleList = new cv.Mat();
+      subdiv.getTriangleList(triangleList);
+      const delaunay = [];
+      for (let i = 0; i < triangleList.rows; i++) {
+        const x1 = triangleList.doubleAt(i, 0);
+        const y1 = triangleList.doubleAt(i, 1);
+        const x2 = triangleList.doubleAt(i, 2);
+        const y2 = triangleList.doubleAt(i, 3);
+        const x3 = triangleList.doubleAt(i, 4);
+        const y3 = triangleList.doubleAt(i, 5);
+        // find nearest indices
+        const idx1 = findNearest(points, x1, y1);
+        const idx2 = findNearest(points, x2, y2);
+        const idx3 = findNearest(points, x3, y3);
+        if (idx1 !== -1 && idx2 !== -1 && idx3 !== -1) {
+          // ensure unique
+          const tri = [idx1, idx2, idx3].sort((a,b) => a-b);
+          const key = tri.join('-');
+          if (!delaunay._set) delaunay._set = new Set();
+          if (!delaunay._set.has(key)) {
+            delaunay.push([idx1, idx2, idx3]);
+            delaunay._set.add(key);
+          }
+        }
+      }
+      triangleList.delete();
+      subdiv.delete();
+      return delaunay;
+    }
+
+    function findNearest(points, x, y) {
+      let best = -1, bd = 1e9;
+      for (let i=0;i<points.length;i++){
+        const dx = points[i].x - x, dy = points[i].y - y;
+        const d = dx*dx + dy*dy;
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    }
+
+    // Compute convex hull indices using OpenCV
+    function convexHullIndices(points) {
+      // points: [{x,y},...]
+      const mat = cv.matFromArray(points.length, 1, cv.CV_32SC2, points.flatMap(p=>[Math.round(p.x), Math.round(p.y)]));
+      const hull = new cv.Mat();
+      cv.convexHull(mat, hull, false, false); // returns indices
+      const indices = [];
+      for (let i=0; i<hull.rows; i++) indices.push(hull.intAt(i,0));
+      mat.delete(); hull.delete();
+      return indices;
+    }
+
+    // Warp triangle src->dst on OpenCV Mats
+    function warpTriangleOpenCV(srcMat, dstMat, tSrc, tDst) {
+      // tSrc, tDst arrays of [ {x,y}, {x,y}, {x,y} ]
+      const r1 = boundingRect(tSrc);
+      const r2 = boundingRect(tDst);
+
+      // offset points
+      const t1 = tSrc.map(p => [p.x - r1.x, p.y - r1.y]);
+      const t2 = tDst.map(p => [p.x - r2.x, p.y - r2.y]);
+
+      const srcTri = cv.matFromArray(3, 1, cv.CV_32FC2, t1.flat());
+      const dstTri = cv.matFromArray(3, 1, cv.CV_32FC2, t2.flat());
+
+      const srcRect = srcMat.roi(new cv.Rect(r1.x, r1.y, r1.width, r1.height));
+      const warpMat = cv.getAffineTransform(srcTri, dstTri);
+      const dstRect = new cv.Mat();
+      const dsize = new cv.Size(r2.width, r2.height);
+      cv.warpAffine(srcRect, dstRect, warpMat, dsize, cv.INTER_LINEAR, cv.BORDER_REFLECT_101);
+
+      const mask = new cv.Mat.zeros(r2.height, r2.width, cv.CV_8UC1);
+      const points = cv.matFromArray(3,1,cv.CV_32SC2,[ t2[0][0],t2[0][1], t2[1][0],t2[1][1], t2[2][0],t2[2][1] ]);
+      cv.fillConvexPoly(mask, points, new cv.Scalar(255,255,255));
+
+      const dstROI = dstMat.roi(new cv.Rect(r2.x, r2.y, r2.width, r2.height));
+      dstRect.copyTo(dstROI, mask);
+
+      // cleanup
+      srcTri.delete(); dstTri.delete(); srcRect.delete(); warpMat.delete(); dstRect.delete();
+      mask.delete(); points.delete(); dstROI.delete();
+    }
+
+    function boundingRect(points) {
+      const xs = points.map(p => p.x), ys = points.map(p => p.y);
+      const x = Math.floor(Math.min(...xs));
+      const y = Math.floor(Math.min(...ys));
+      const w = Math.ceil(Math.max(...xs) - x);
+      const h = Math.ceil(Math.max(...ys) - y);
+      return { x, y, width: Math.max(1,w), height: Math.max(1,h) };
+    }
+
+    // Main swap function for one frame (OpenCV mats)
+    function performFullSwap(srcMat, srcPts, videoMat, tgtPts, outCanvas) {
+      // srcMat: cv.Mat of uploaded source image (RGB/BGR depending), videoMat: current frame mat
+      // srcPts, tgtPts: arrays of {x,y} in pixel coords aligned to their respective images
+
+      // We'll warp source onto video size
+      const dst = videoMat.clone();
+
+      // compute hull on target landmarks to build mask
+      const hullIdx = convexHullIndices(tgtPts);
+      const hull = hullIdx.map(i => tgtPts[i]);
+
+      // compute Delaunay triangulation (we'll do on target points)
+      const delaunay = srcTriangles ? srcTriangles : calculateDelaunayTriangles(srcPts, srcMat.cols, srcMat.rows);
+
+      // create warped image same size as dst
+      const srcWarped = new cv.Mat.zeros(dst.rows, dst.cols, dst.type());
+      // Note: our delaunay triangles were generated for source-landmarks indexing; map triangles using nearest correspondences.
+      // We'll assume srcPts and tgtPts arrays are same length and corresponding indices represent same landmarks.
+      for (let tri of delaunay) {
+        const tSrc = [ srcPts[tri[0]], srcPts[tri[1]], srcPts[tri[2]] ];
+        const tTgt = [ tgtPts[tri[0]], tgtPts[tri[1]], tgtPts[tri[2]] ];
+        warpTriangleOpenCV(srcMat, srcWarped, tSrc, tTgt);
+      }
+
+      // build mask from hull on dst size
+      const mask = new cv.Mat.zeros(dst.rows, dst.cols, cv.CV_8UC1);
+      const hullPts = cv.matFromArray(hull.length, 1, cv.CV_32SC2, hull.flatMap(p=>[Math.round(p.x), Math.round(p.y)]));
+      cv.fillPoly(mask, [hullPts], new cv.Scalar(255,255,255));
+      hullPts.delete();
+
+      // center for seamless clone
+      const m = cv.moments(mask, true);
+      const cx = Math.round(m.m10 / (m.m00 + 1e-5));
+      const cy = Math.round(m.m01 / (m.m00 + 1e-5));
+      const center = new cv.Point(cx, cy);
+
+      // seamless clone
+      const output = new cv.Mat();
+      try {
+        cv.seamlessClone(srcWarped, dst, mask, center, output, cv.NORMAL_CLONE);
+      } catch (err) {
+        // fallback: simple copy
+        dst.copyTo(output);
+        srcWarped.copyTo(output, mask);
+      }
+
+      // show on canvas
+      cv.imshow(outCanvas, output);
+
+      // cleanup
+      dst.delete(); srcWarped.delete(); mask.delete(); output.delete();
+    }
+
+    // Precompute Delaunay for source landmarks (once)
+    function precomputeSourceTriangles(srcPts, width, height) {
+      // use target size = source image size
+      const delaunay = calculateDelaunayTriangles(srcPts, width, height);
+      return delaunay;
+    }
+
+    // ---- UI handlers ----
+    srcFile.addEventListener('change', async (ev) => {
+      const f = ev.target.files[0];
+      if (!f) return;
+      const url = URL.createObjectURL(f);
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = async () => {
+        srcImg = img;
+        // compute landmarks for source using faceMesh in a hidden canvas
+        const tmp = document.createElement('canvas');
+        tmp.width = img.width; tmp.height = img.height;
+        const tctx = tmp.getContext('2d'); tctx.drawImage(img,0,0);
+        // create an ImageBitmap for mediapipe call
+        const bitmap = await createImageBitmap(img);
+        // use a temporary faceMesh run to get landmarks for source
+        await new Promise((resolve) => {
+          const onSrcRes = (results) => {
+            if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+              alert('No face detected in uploaded source image. Choose a clearer frontal face image.');
+              resolve();
+              return;
+            }
+            const lm = results.multiFaceLandmarks[0];
+            // convert normalized to pixel coords for source image size
+            srcLandmarks = mpToPixels(lm, img.width, img.height);
+            // precompute triangles (Delaunay) in source coordinates
+            srcTriangles = precomputeSourceTriangles(srcLandmarks, img.width, img.height);
+            // stop listener
+            faceMesh.onResults(null); // detach listener
+            resolve();
+          };
+          faceMesh.onResults(onSrcRes);
+          // feed image bitmap
+          faceMesh.send({image: bitmap});
+        });
+        URL.revokeObjectURL(url);
+        // enable startSwap if camera ready & opencv ready
+        if (camReady && openCvReady && srcLandmarks) startSwapBtn.disabled = false;
+      };
+      img.src = url;
+    });
+
+    startCamBtn.addEventListener('click', async () => {
+      if (camStream) {
+        // already running
+        return;
+      }
+      try {
+        camStream = await navigator.mediaDevices.getUserMedia({ video: { width: OUT_W, height: OUT_H }, audio: false });
+        video.srcObject = camStream;
+        camReady = true;
+        // connect MediaPipe camera utils to feed video frames to faceMesh
+        // but we'll instead use camera only for display and call faceMesh.send per-frame for best control
+        if (openCvReady && srcLandmarks) startSwapBtn.disabled = false;
+      } catch (err) {
+        alert('Camera error: ' + err.message);
+      }
+    });
+
+    startSwapBtn.addEventListener('click', async () => {
+      if (!camReady || !openCvReady || !srcLandmarks) {
+        alert('Make sure camera started, OpenCV loaded and source image uploaded with detected face.');
+        return;
+      }
+      swapRunning = true;
+      startSwapBtn.disabled = true;
+      stopSwapBtn.disabled = false;
+      // Start per-frame processing loop: feed frames to faceMesh and onResults warping
+      // We'll use an asynchronous loop using requestAnimationFrame
+      async function frameLoop() {
+        if (!swapRunning) return;
+        // send current video frame to faceMesh
+        await faceMesh.send({image: video});
+        requestAnimationFrame(frameLoop);
+      }
+      frameLoop();
+    });
+
+    stopSwapBtn.addEventListener('click', () => {
+      swapRunning = false;
+      startSwapBtn.disabled = false;
+      stopSwapBtn.disabled = true;
+      // Render plain camera frame to output
+      outCtx.drawImage(video, 0, 0, output.width, output.height);
+    });
+
+    snapshotBtn.addEventListener('click', () => {
+      const a = document.createElement('a');
+      a.href = output.toDataURL('image/png');
+      a.download = 'face-swap-snapshot.png';
+      a.click();
+    });
+
+    // ---- Setup faceMesh results callback ----
+    setupFaceMesh(async (results) => {
+      // results.multiFaceLandmarks is an array; we handle single-face
+      if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+        // if not swapping, just draw camera
+        if (!swapRunning) {
+          outCtx.drawImage(video, 0, 0, output.width, output.height);
+        }
+        return;
+      }
+      const landmarks = results.multiFaceLandmarks[0]; // 468 normalized points
+      const tgtPts = mpToPixels(landmarks, output.width, output.height);
+
+      // draw basic output frame if not swapping
+      if (!swapRunning) {
+        outCtx.drawImage(video, 0, 0, output.width, output.height);
+        return;
+      }
+
+      // Convert camera frame to OpenCV Mat
+      // create an offscreen canvas to extract exact pixels matching OUT_W x OUT_H
+      const cap = document.createElement('canvas');
+      cap.width = output.width; cap.height = output.height;
+      const cctx = cap.getContext('2d');
+      cctx.drawImage(video, 0, 0, cap.width, cap.height);
+      if (lastFrameMat) lastFrameMat.delete();
+      lastFrameMat = cv.imread(cap); // BGR order in cv.Mat
+
+      // Load source image into cv.Mat and possibly resize to match scale differences between source and target
+      // We'll use source at original pixel scale and warp triangles to target pixel coords.
+      const tmpCanvas = document.createElement('canvas');
+      tmpCanvas.width = srcImg.width; tmpCanvas.height = srcImg.height;
+      tmpCanvas.getContext('2d').drawImage(srcImg,0,0);
+      const srcMat = cv.imread(tmpCanvas);
+
+      try {
+        // Map source landmarks into same indexing as target (MediaPipe indices align for face mesh; source landmarks are also from faceMesh)
+        // But if sourceLandmarks were computed from the source image at its resolution, we already have srcLandmarks array.
+        // For safety, ensure arrays are same length (468); if not, try fallback simple overlay
+        if (!srcLandmarks || srcLandmarks.length !== tgtPts.length) {
+          // fallback: simple overlay scaled to bounding box
+          const det = results.multiFaceLandmarks[0];
+          const bbox = results.multiFaceLandmarks[0].reduce((b, p) => {
+            b.minX = Math.min(b.minX, p.x); b.minY = Math.min(b.minY, p.y);
+            b.maxX = Math.max(b.maxX, p.x); b.maxY = Math.max(b.maxY, p.y); return b;
+          }, {minX:1,minY:1,maxX:0,maxY:0});
+          const boxW = (bbox.maxX - bbox.minX) * output.width;
+          const boxH = (bbox.maxY - bbox.minY) * output.height;
+          const boxX = bbox.minX * output.width;
+          const boxY = bbox.minY * output.height;
+          outCtx.drawImage(video, 0, 0, output.width, output.height);
+          outCtx.drawImage(srcImg, boxX, boxY, boxW, boxH);
+          srcMat.delete();
+          return;
+        }
+
+        // Build arrays for OpenCV warping functions
+        const srcPtsPixels = srcLandmarks.map(p => ({ x: p.x, y: p.y }));
+        const tgtPtsPixels = tgtPts.map(p => ({ x: p.x, y: p.y }));
+
+        // ensure we have srcTriangles (Delaunay) computed for source
+        if (!srcTriangles) srcTriangles = precomputeSourceTriangles(srcPtsPixels, srcMat.cols, srcMat.rows);
+
+        // Perform the heavy lifting warp + seamlessClone
+        performFullSwap(srcMat, srcPtsPixels, lastFrameMat, tgtPtsPixels, output);
+
+      } catch (err) {
+        console.error('Swap error:', err);
+        // fallback: draw simple camera
+        outCtx.drawImage(video, 0, 0, output.width, output.height);
+      } finally {
+        srcMat.delete();
+        // lastFrameMat kept for reuse next frame (deleted at next frame read)
+      }
+    });
+
+    // initialize: wait for OpenCV, setup faceMesh, etc.
+    (async () => {
+      await waitForOpenCv(); // ensures cv available
+      // create basic faceMesh (listener set later)
+      setupFaceMesh(()=>{ /* placeholder, will be attached/overwritten by handlers above */});
+      // we already set the final onResults later when processing source image and camera frames;
+      // but we need a consistent faceMesh instance so that srcFile processing can use faceMesh.send
+      // no additional action needed here
+      console.log('OpenCV ready and FaceMesh available.');
+    })();
+
+    // Clean up on page unload
+    window.addEventListener('beforeunload', () => {
+      if (camStream) {
+        camStream.getTracks().forEach(t => t.stop());
+      }
+      if (lastFrameMat) lastFrameMat.delete();
+    });
+
+  })();
+  </script>
+</body>
+</html>
